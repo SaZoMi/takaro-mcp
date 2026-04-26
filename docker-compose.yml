@@ -1,0 +1,15 @@
+services:
+  takaro-mcp:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      PORT: "3000"
+      MODULES_ROOT: /workspace/modules
+      # module-to-json.js is bundled in the image — no external mount needed
+    volumes:
+      # Live-mount module source files so edits on the host are immediately visible
+      - ../ai-module-writer/modules:/workspace/modules
+    restart: unless-stopped
