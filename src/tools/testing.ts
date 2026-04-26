@@ -200,4 +200,30 @@ export function registerTestingTools(server: McpServer): void {
       }
     },
   );
+
+  server.tool(
+    'manage_settings',
+    'Get or set Takaro game server settings. Key settings: "commandPrefix" (the prefix players use for commands, e.g. "+" or "/"), "serverChatName" (bot display name). action="get" returns current value, action="set" updates it.',
+    {
+      action: z.enum(['get', 'set']).describe('Action to perform'),
+      key: z.string().describe('Setting key, e.g. "commandPrefix"'),
+      gameServerId: z.string().optional().describe('Game server ID (scopes the setting to a specific server)'),
+      value: z.string().optional().describe('New value to set (required for action="set")'),
+    },
+    async ({ action, key, gameServerId, value }) => {
+      try {
+        const client = await getClient();
+        if (action === 'get') {
+          const result = await client.settings.settingsControllerGet([key as SettingsControllerGetKeysEnum], gameServerId);
+          return { content: [{ type: 'text' as const, text: JSON.stringify(result.data.data, null, 2) }] };
+        } else {
+          if (value === undefined) return { content: [{ type: 'text' as const, text: JSON.stringify({ error: true, code: 'MISSING_VALUE', message: 'value is required for action="set"' }) }] };
+          const result = await client.settings.settingsControllerSet(key, { value, gameServerId });
+          return { content: [{ type: 'text' as const, text: JSON.stringify(result.data.data, null, 2) }] };
+        }
+      } catch (err) {
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ error: true, code: 'MANAGE_SETTINGS_ERROR', message: String(err) }) }] };
+      }
+    },
+  );
 }
