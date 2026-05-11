@@ -13,6 +13,7 @@
     "@takaro/apiclient": "0.4.17",
     "dotenv": "^16.4.0",
     "express": "^4.19.0",
+    "langfuse": "^3.38.20",
     "zod": "^3.23.0"
   },
   "devDependencies": {

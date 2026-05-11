@@ -157,7 +157,7 @@ export function registerTestingTools(server: McpServer): void {
 
   server.tool(
     'bot_action',
-    'Control a Mineflayer test bot via the bot HTTP service (default port 3101). Actions: "create" spawns a bot, "chat" sends a message in-game, "status" checks if the bot is connected, "delete" removes the bot. The bot service must be running (docker compose up bot in ai-module-writer).',
+    'Control a Mineflayer test bot via the bot HTTP service (default port 3101). Actions: "create" spawns a bot, "chat" sends a message in-game, "status" checks if the bot is connected, "delete" removes the bot. The bot service must be running (docker compose up bot in ai-module-writer). Read takaro://bot-api for the full API reference including player queries, movement, and troubleshooting.',
     {
       action: z.enum(['create', 'chat', 'delete', 'status']).describe('Action to perform'),
       botName: z.string().describe('Bot username/name'),

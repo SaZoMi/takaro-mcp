@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const MODULES_ROOT: string = path.resolve(
-  process.env['MODULES_ROOT'] ?? path.join('D:', 'BachMCP', 'ai-module-writer', 'modules'),
+  process.env['MODULES_ROOT'] ?? path.join('D:', 'BachMCP', 'sazomi', 'ai-module-writer', 'modules'),
 );
 
 // Default: the copy compiled inside takaro-mcp/dist/scripts/ (no dependency on ai-module-writer build)

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { getClient } from './client.js';
 import { startHttpServer } from './server.js';
 import { MODULES_ROOT, MODULE_TO_JSON_SCRIPT } from './utils/fs-guard.js';
+import { shutdownLangfuse } from './utils/langfuse.js';
 import fs from 'fs';
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10);
@@ -42,6 +43,15 @@ async function main(): Promise<void> {
 
   startHttpServer(PORT);
 }
+
+async function shutdown(signal: string): Promise<void> {
+  console.log(`\nReceived ${signal}, shutting down Langfuse...`);
+  await shutdownLangfuse();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => process.exit(1)); });
+process.on('SIGINT',  () => { shutdown('SIGINT').catch(() => process.exit(1)); });
 
 main().catch((err) => {
   console.error('Fatal error:', err);
