@@ -1,0 +1,10 @@
+{
+  "issues": [
+    {
+      "errorMessage": "File content (41211 tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
+      "toolName": "Read",
+      "occurrences": 2,
+      "lastSeen": "2026-05-12T02:44:49.128Z"
+    }
+  ]
+}

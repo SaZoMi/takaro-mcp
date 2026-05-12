@@ -11,15 +11,17 @@
 import 'dotenv/config';
 import { spawn } from 'child_process';
 import path from 'path';
+import { readdir, readFile } from 'fs/promises';
 import { getLangfuse } from '../utils/langfuse.js';
 import { parseStreamJson } from '../utils/stream-parser.js';
 import { deriveScores } from '../utils/eval-metrics.js';
 import { persistKnownIssues } from '../utils/known-issues.js';
+import { buildOrchestratorPrompt } from './orchestrator-prompt.js';
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10);
 const MCP_URL = `http://localhost:${PORT}/mcp`;
 const DATASET_NAME = 'takaro-module-eval';
-const MAX_TURNS = parseInt(process.env['EVAL_MAX_TURNS'] ?? '40', 10);
+const MAX_TURNS = parseInt(process.env['EVAL_MAX_TURNS'] ?? '60', 10);
 
 const ALL_MODELS = [
   'claude-opus-4-7',
@@ -30,17 +32,26 @@ const ALL_MODELS = [
 const BRASSY22_SERVER_ID = '7a494b4b-647d-481d-89d1-beb7e6295669';
 const EVAL_BOT_NAME = 'eval-bot';
 
-function buildSystemPrompt(model: string, promptName: string): string {
-  const suffix = model.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+function modelShort(model: string): string {
+  if (model.includes('opus'))  return 'opus';
+  if (model.includes('haiku')) return 'haiku';
+  return 'sonnet';
+}
+
+function makeModuleName(promptName: string, model: string, timestamp: string): string {
+  return `${promptName}-${modelShort(model)}-${timestamp}`;
+}
+
+function buildSystemPrompt(model: string, promptName: string, moduleName: string): string {
   return [
     'You are a Takaro module developer. Your task is to build, deploy, test, and clean up a Takaro module.',
     'Use the available MCP tools. Do not ask for clarification — execute the full workflow below.',
     '',
     `STEP 0 — KNOWN ISSUES: Read takaro://known-issues/${promptName} and avoid any listed errors.`,
     '',
-    `STEP 1 — BUILD: Scaffold, write all files (module.json + source files), and push the module.`,
-    `  - Append "-${suffix}" to the module name everywhere (module.json "name" and scaffold directory).`,
-    `  - Example: "server-messages" → "server-messages-${suffix}"`,
+    `STEP 1 — BUILD: Scaffold the module with the exact name "${moduleName}".`,
+    `  Use "${moduleName}" as the name in both the scaffold directory and in module.json's "name" field.`,
+    '  Write all source files (JS commands/hooks/cronjobs/functions) and the module.json, then push.',
     '',
     `STEP 2 — INSTALL: Install the module on game server "${BRASSY22_SERVER_ID}" using install_module.`,
     '  - Use the moduleId and latestVersionId from push_module\'s response.',
@@ -55,10 +66,11 @@ function buildSystemPrompt(model: string, promptName: string): string {
     '  - For cronjob-only modules: verify the installation succeeded (no test command needed).',
     '  - For hook-only modules: verify the installation succeeded.',
     '',
-    'STEP 5 — HANDLE FAILURES: If any test fails:',
-    '  1. Call uninstall_module to remove the broken version.',
-    '  2. Fix the code, push a new version, reinstall, and retest (back to STEP 2).',
-    '  3. Repeat up to 3 times total before giving up.',
+    'STEP 5 — HANDLE FAILURES: If a test fails or poll_events returns success=false:',
+    '  1. Call get_failed_events to read the error log.',
+    '  2. Determine if the error is fixable (code bug, wrong API call, bad argument schema).',
+    '     — If fixable: uninstall_module, fix the source file(s), push, reinstall, retest. Repeat up to 3 times.',
+    '     — If NOT fixable (server down, infrastructure error, game server unreachable): proceed to cleanup.',
     '',
     'STEP 6 — CLEANUP (always run, even on failure):',
     `  - uninstall_module(moduleId, gameServerId:"${BRASSY22_SERVER_ID}")`,
@@ -66,9 +78,35 @@ function buildSystemPrompt(model: string, promptName: string): string {
   ].join('\n');
 }
 
+// ─── LOC from disk (for subagent runs where write_module_file is not in parent stream) ───
+
+async function countLinesFromDisk(moduleName: string): Promise<number> {
+  const modulesRoot = (process.env['MODULES_ROOT'] ?? 'D:/BachMCP/sazomi/ai-module-writer/modules')
+    .replace(/\\/g, '/');
+  const srcDir = path.join(modulesRoot, moduleName, 'src');
+  let total = 0;
+  const walk = async (dir: string): Promise<void> => {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full);
+      } else if (e.name.endsWith('.js') || e.name.endsWith('.ts')) {
+        try {
+          const content = await readFile(full, 'utf8');
+          total += content.split('\n').length;
+        } catch { /* skip unreadable files */ }
+      }
+    }
+  };
+  await walk(srcDir);
+  return total;
+}
+
 // ─── CLI argument parsing ──────────────────────────────────────────────────
 
-function parseArgs(): { models: string[]; prompts: string[] | 'all'; runName: string } {
+function parseArgs(): { models: string[]; prompts: string[] | 'all'; runName: string; orchestrator: boolean } {
   const args = process.argv.slice(2);
   const get = (flag: string): string | undefined => {
     const idx = args.indexOf(flag);
@@ -84,7 +122,9 @@ function parseArgs(): { models: string[]; prompts: string[] | 'all'; runName: st
   const date = new Date().toISOString().slice(0, 10);
   const runName = get('--run-name') ?? `eval-${date}`;
 
-  return { models, prompts, runName };
+  const orchestrator = args.includes('--orchestrator');
+
+  return { models, prompts, runName, orchestrator };
 }
 
 // ─── MCP helpers ──────────────────────────────────────────────────────────
@@ -139,14 +179,17 @@ async function fetchPrompts(): Promise<Array<{ name: string; text: string; descr
 
 // ─── Claude Code runner ───────────────────────────────────────────────────
 
-function runClaude(promptText: string, model: string, promptName: string, verbose = false): Promise<string> {
+function runClaude(promptText: string, model: string, promptName: string, moduleName: string, verbose = false, orchestrator = false): Promise<string> {
   return new Promise((resolve, reject) => {
-    const fullPrompt = `${buildSystemPrompt(model, promptName)}\n\n${promptText}`;
+    const systemPrompt = orchestrator
+      ? buildOrchestratorPrompt(moduleName, promptName)
+      : buildSystemPrompt(model, promptName, moduleName);
+    const fullPrompt = `${systemPrompt}\n\n${promptText}`;
     // Resolve the .mcp.json one level above the package root so Claude can find the takaro server
     const mcpConfigPath = path.resolve(process.cwd(), '..', '.mcp.json');
 
     const args = [
-      '-p', fullPrompt,
+      '-p', '-',
       '--model', model,
       '--output-format', 'stream-json',
       '--verbose',
@@ -158,7 +201,9 @@ function runClaude(promptText: string, model: string, promptName: string, verbos
     let stdout = '';
     let partial = '';
 
-    const proc = spawn('claude', args, { env: process.env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn('claude', args, { env: process.env, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    proc.stdin.write(fullPrompt, 'utf8');
+    proc.stdin.end();
 
     proc.stdout.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
@@ -227,15 +272,23 @@ async function postToLangfuse(opts: {
   runName: string;
   promptName: string;
   model: string;
+  moduleName: string;
   promptText: string;
   rawOutput: string;
 }): Promise<void> {
   const lf = getLangfuse();
   if (!lf) { console.warn('  Langfuse not configured — skipping trace'); return; }
 
-  const { runName, promptName, model, promptText, rawOutput } = opts;
+  const { runName, promptName, model, moduleName, promptText, rawOutput } = opts;
   const run = parseStreamJson(rawOutput);
   const scores = deriveScores(run);
+
+  // For subagent runs, write_module_file calls are inside Agent tool outputs and not visible
+  // in the parent stream — count lines directly from disk if the parent stream shows 0.
+  if (scores.lines_of_code === 0) {
+    const diskLoc = await countLinesFromDisk(moduleName);
+    if (diskLoc > 0) scores.lines_of_code = diskLoc;
+  }
 
   // Root trace — sessionId groups all models for the same prompt+run in one session
   const trace = lf.trace({
@@ -474,9 +527,7 @@ async function postToLangfuse(opts: {
 
 // ─── Post-run cleanup ─────────────────────────────────────────────────────
 
-async function emergencyCleanup(run: import('../utils/stream-parser.js').RunResult, model: string): Promise<void> {
-  const suffix = model.replace(/[^a-z0-9]/gi, '-').toLowerCase();
-
+async function emergencyCleanup(run: import('../utils/stream-parser.js').RunResult): Promise<void> {
   // Find moduleId from any successful push_module call
   const pushCall = [...run.toolCalls].reverse().find(tc =>
     (tc.name === 'mcp__takaro__push_module' || tc.name === 'push_module') && !tc.isError
@@ -497,18 +548,17 @@ async function emergencyCleanup(run: import('../utils/stream-parser.js').RunResu
     await mcpCall('tools/call', { name: 'mcp__takaro__bot_action', arguments: { action: 'delete', botName: EVAL_BOT_NAME } });
     console.log(`  cleanup: deleted bot ${EVAL_BOT_NAME}`);
   } catch { /* best-effort */ }
-
-  void suffix; // suppress unused warning — suffix used for context only
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const { models, prompts: promptFilter, runName } = parseArgs();
+  const { models, prompts: promptFilter, runName, orchestrator } = parseArgs();
 
   console.log(`Eval run: ${runName}`);
   console.log(`Models:   ${models.join(', ')}`);
   console.log(`Prompts:  ${promptFilter === 'all' ? 'all' : promptFilter.join(', ')}`);
+  console.log(`Mode:     ${orchestrator ? 'orchestrator (subagent delegation)' : 'standard'}`);
   console.log(`Max turns: ${MAX_TURNS}\n`);
 
   console.log(`Fetching prompts from MCP server at ${MCP_URL}...`);
@@ -527,16 +577,20 @@ async function main(): Promise<void> {
 
   let completed = 0;
   const total = models.length * targetPrompts.length;
+  // Single timestamp for the whole eval run — all modules created in this run share the same stamp
+  const runTs = new Date().toISOString().replace(/[-T:]/g, '').slice(2, 12); // YYMMDDHHmm
 
   for (const model of models) {
     for (const prompt of targetPrompts) {
       completed++;
+      const moduleName = makeModuleName(prompt.name, model, runTs);
       console.log(`[${completed}/${total}] ${model} × ${prompt.name}`);
+      console.log(`  module: ${moduleName}`);
 
       let rawOutput = '';
       let parsedRun: import('../utils/stream-parser.js').RunResult | null = null;
       try {
-        rawOutput = await runClaude(prompt.text, model, prompt.name, true);
+        rawOutput = await runClaude(prompt.text, model, prompt.name, moduleName, true, orchestrator);
         parsedRun = parseStreamJson(rawOutput);
         const scores = deriveScores(parsedRun);
         console.log(`  turns=${scores.num_turns} tools=${scores.tool_call_count} errors=${scores.error_count} shots=${scores.shot_count} loc=${scores.lines_of_code} tokens=${scores.total_tokens} success=${scores.success === 1} build=${scores.build_success === 1} install=${scores.install_success === 1} test=${scores.functional_test_passed === 1}`);
@@ -547,11 +601,11 @@ async function main(): Promise<void> {
 
       // Emergency cleanup — runs regardless of Claude's behaviour
       if (parsedRun) {
-        await emergencyCleanup(parsedRun, model);
+        await emergencyCleanup(parsedRun);
       }
 
       try {
-        await postToLangfuse({ runName, promptName: prompt.name, model, promptText: prompt.text, rawOutput });
+        await postToLangfuse({ runName, promptName: prompt.name, model, moduleName, promptText: prompt.text, rawOutput });
         console.log('  → posted to Langfuse');
       } catch (err) {
         console.error(`  Langfuse post failed: ${err}`);

@@ -61,7 +61,7 @@ docker compose down
 
 ## Connecting to Claude Code
 
-Add a `.mcp.json` to your project root (already created at `D:\BachMCP\.mcp.json`):
+Add a `.mcp.json` to your project root:
 
 ```json
 {
@@ -91,7 +91,7 @@ npm run build
 node dist/index.js
 ```
 
-The `modules/` directory is read from `MODULES_ROOT` (defaults to `D:/BachMCP/ai-module-writer/modules`). Override via `.env`:
+The `modules/` directory is read from `MODULES_ROOT` (defaults to `D:/BachMCP/sazomi/ai-module-writer/modules`). Override via `.env`:
 
 ```env
 MODULES_ROOT=C:/path/to/your/modules
@@ -108,7 +108,7 @@ MODULES_ROOT=C:/path/to/your/modules
 | `TAKARO_PASSWORD` | Yes | — | Account password |
 | `TAKARO_DOMAIN_ID` | Yes | — | Domain/workspace name |
 | `PORT` | No | `3000` | HTTP port to listen on |
-| `MODULES_ROOT` | No | `D:/BachMCP/ai-module-writer/modules` | Path to local module directories |
+| `MODULES_ROOT` | No | `D:/BachMCP/sazomi/ai-module-writer/modules` | Path to local module directories |
 | `BOT_PORT` | No | `3101` | Port for the Mineflayer bot service |
 
 ---
@@ -183,7 +183,7 @@ MODULES_ROOT=C:/path/to/your/modules
 
 ## Resources
 
-The server also exposes three MCP resources readable by the LLM:
+The server also exposes MCP resources readable by the LLM on demand — they are not injected into every request, so they do not bloat the context window unless explicitly read:
 
 | URI | Description |
 |-----|-------------|
@@ -192,6 +192,9 @@ The server also exposes three MCP resources readable by the LLM:
 | `takaro://reference-modules` | List of local reference modules the agent can read for examples |
 | `takaro://reference-modules/{name}` | Full source of a reference module |
 | `takaro://module/{name}/files` | Live file map of a module under development |
+| `takaro://bot-api` | Full HTTP API reference for the Mineflayer test bot service (create, chat, status, delete, player queries, movement) |
+| `takaro://known-issues` | List of all prompt names that have recorded failure patterns |
+| `takaro://known-issues/{promptName}` | Known error patterns for a specific prompt, accumulated from previous failed eval runs |
 
 ---
 
@@ -250,12 +253,17 @@ takaro-mcp/
     ├── server.ts             # McpServer factory + Express HTTP transport (port 3000)
     ├── client.ts             # Takaro API client singleton
     ├── scripts/
-    │   └── module-to-json.ts # Bundled converter (no ai-module-writer build needed)
+    │   ├── module-to-json.ts # Bundled converter (no ai-module-writer build needed)
+    │   └── eval-runner.ts    # Evaluation harness — runs prompts against Claude, posts metrics to Langfuse
     ├── types/
     │   └── module.ts         # Shared module type definitions
     ├── utils/
     │   ├── fs-guard.ts       # Path-traversal guard + MODULES_ROOT resolution
-    │   └── validate.ts       # Entity name validation
+    │   ├── validate.ts       # Entity name validation
+    │   ├── langfuse.ts       # Langfuse client singleton
+    │   ├── stream-parser.ts  # Parses Claude stream-json output into structured tool call records
+    │   ├── eval-metrics.ts   # Derives 31 numeric scores from a parsed run
+    │   └── known-issues.ts   # File-backed error memory per prompt (data/known-issues/)
     ├── tools/
     │   ├── discovery.ts
     │   ├── filesystem.ts
@@ -268,5 +276,38 @@ takaro-mcp/
     │   ├── monitoring.ts
     │   └── integrations.ts
     └── resources/
-        └── index.ts          # MCP resources (templates, API reference, module files)
+        └── index.ts          # MCP resources (templates, API reference, bot API, known issues)
+```
+
+---
+
+## Evaluation Harness
+
+The `eval-runner` script benchmarks prompts against Claude models, traces every run to Langfuse, and accumulates failure patterns for future runs.
+
+```bash
+# Single prompt, single model
+node dist/scripts/eval-runner.js --model claude-sonnet-4-6 --prompt build-server-messages --run-name baseline
+
+# All prompts, all models
+node dist/scripts/eval-runner.js --model all --prompt all --run-name baseline-v1
+```
+
+**What it does per run:**
+
+1. Fetches the prompt from the MCP server (`prompts/list` + `prompts/get`)
+2. Spawns `claude -p` with the prompt + a 6-step system prompt (known-issues → build → install → bot connect → test → cleanup)
+3. Parses the `stream-json` output into structured tool call records
+4. Runs emergency cleanup (uninstall module, delete bot) regardless of Claude's behaviour
+5. Posts a hierarchical Langfuse trace with phase spans (build / deploy\_cycle\_N / fix\_N / cleanup), 31 numeric scores, and full token breakdown
+6. Persists error patterns to `data/known-issues/{promptName}.json` for failed runs
+
+**Langfuse scores posted (31 total):** `success`, `build_success`, `install_success`, `functional_test_passed`, `zero_shot_success`, `push_attempt_count`, `shot_count`, `self_correction_count`, `test_cycle_count`, `error_count`, `error_in_build`, `error_in_install`, `error_in_test`, `error_recovery_efficiency`, `duration_ms`, `build_duration_ms`, `test_duration_ms`, `time_to_first_push_ms`, `throughput_tools_per_min`, `num_turns`, `tool_call_count`, `total_tokens`, `input_tokens`, `output_tokens`, `reasoning_tokens`, `response_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `lines_of_code`, `module_complexity`
+
+**Required env vars for eval:**
+
+```env
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
 ```
