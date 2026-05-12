@@ -120,18 +120,19 @@ export function startHttpServer(port = 3000): void {
 
   // POST: client → server messages (tool calls, initialize, etc.)
   app.post('/mcp', async (req: Request, res: Response) => {
+    // Disable socket timeout so long-polling tools (poll_events ~30 s) don't drop mid-flight.
+    req.socket.setTimeout(0);
     const sessionId = resolveSessionId(req);
     await requestContext.run({ sessionId }, async () => {
       const server = createMcpServer();
+      // sessionIdGenerator: undefined = stateless mode (new transport per request, no SSE session).
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      // Register close handler AFTER connecting so transport.close() only runs cleanup,
-      // never races with an in-flight handleRequest write.
       try {
         await server.connect(transport);
-        res.on('close', () => { transport.close().catch(() => {}); });
         await transport.handleRequest(req, res, req.body);
+        // Stateless POST: transport is single-use. handleRequest() already ends the response,
+        // so we must NOT call transport.close() afterwards — that causes ERR_HTTP_HEADERS_SENT.
       } catch (err) {
-        // ERR_HTTP_HEADERS_SENT means the response already succeeded — suppress it.
         const code = (err as NodeJS.ErrnoException).code;
         if (code === 'ERR_HTTP_HEADERS_SENT') return;
         if (!res.headersSent) res.status(500).json({ error: String(err) });
